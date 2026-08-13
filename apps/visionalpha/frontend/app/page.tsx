@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Activity, BarChart3, Boxes, BrainCircuit, Database, Gauge, LineChart, Radio, Search, UploadCloud, Video } from "lucide-react";
 import { domains, factors, history } from "@/lib/data";
 
@@ -12,14 +12,23 @@ type Analysis = {
   unique_tracks?: number;
   activity_index?: number;
   counts?: Record<string, number>;
+  persisted?: boolean;
 };
 
-function LinePlot() {
+type HistoryItem = {
+  created_at?: string;
+  activity_index?: number | string | null;
+};
+
+function LinePlot({ values }: { values: number[] }) {
   const points = useMemo(() => {
-    const min = Math.min(...history) - 3;
-    const max = Math.max(...history) + 3;
-    return history.map((v, i) => `${(i / (history.length - 1)) * 100},${92 - ((v - min) / (max - min)) * 78}`).join(" ");
-  }, []);
+    const safeValues = values.length ? values : [50];
+    const min = Math.min(...safeValues) - 3;
+    const max = Math.max(...safeValues) + 3;
+    const range = Math.max(max - min, 1);
+    const denominator = Math.max(safeValues.length - 1, 1);
+    return safeValues.map((v, i) => `${(i / denominator) * 100},${92 - ((v - min) / range) * 78}`).join(" ");
+  }, [values]);
   const area = `0,100 ${points} 100,100`;
   return (
     <svg className="chart" viewBox="0 0 100 100" preserveAspectRatio="none" aria-label="Economic activity index history">
@@ -47,6 +56,29 @@ export default function Dashboard() {
   const [busy, setBusy] = useState(false);
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [historyData, setHistoryData] = useState<number[]>(history);
+  const [usingPersistedHistory, setUsingPersistedHistory] = useState(false);
+
+  async function loadHistory() {
+    try {
+      const response = await fetch(`${apiUrl}/api/v1/history?limit=30`, { cache: "no-store" });
+      if (!response.ok) return;
+      const payload = await response.json() as { items?: HistoryItem[] };
+      const values = (payload.items || [])
+        .map(item => Number(item.activity_index))
+        .filter(value => Number.isFinite(value));
+      if (values.length) {
+        setHistoryData(values);
+        setUsingPersistedHistory(true);
+      }
+    } catch {
+      // The seeded research series remains visible when persistence is unavailable.
+    }
+  }
+
+  useEffect(() => {
+    void loadHistory();
+  }, []);
 
   async function analyze(file?: File) {
     if (!file) return;
@@ -55,11 +87,18 @@ export default function Dashboard() {
     try {
       const response = await fetch(`${apiUrl}/api/v1/analyze`, { method: "POST", body });
       if (!response.ok) throw new Error(`Backend returned ${response.status}`);
-      setAnalysis(await response.json());
+      const result = await response.json() as Analysis;
+      setAnalysis(result);
+      if (result.persisted) await loadHistory();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Analysis failed");
     } finally { setBusy(false); }
   }
+
+  const latestIndex = historyData.at(-1) ?? 82.41;
+  const firstIndex = historyData[0] ?? latestIndex;
+  const changePct = historyData.length > 1 ? ((latestIndex - firstIndex) / Math.max(Math.abs(firstIndex), 0.001)) * 100 : 0;
+  const regime = latestIndex >= 55 ? "ECONOMIC EXPANSION" : latestIndex <= 45 ? "ECONOMIC CONTRACTION" : "NEUTRAL ACTIVITY";
 
   return (
     <div className="shell">
@@ -80,19 +119,19 @@ export default function Dashboard() {
           <div className="nav-label" style={{marginTop: 24}}>DATA</div>
           <button className="nav-item"><Database/> Sources</button>
           <button className="nav-item"><Activity/> Backtests</button>
-          <div className="sidebar-foot"><strong>Research build 0.1</strong><span>Raw CV observations are normalized against location-specific baselines before becoming investment factors.</span></div>
+          <div className="sidebar-foot"><strong>Research build 0.2</strong><span>Raw CV observations are normalized against location-specific baselines before becoming investment factors.</span></div>
         </aside>
 
         <main className="main">
           <div className="hero-row">
             <div><div className="eyebrow">Alternative Data Intelligence</div><h1>Economic Activity Monitor</h1><div className="subtitle">Computer vision derived activity proxies, standardized for investment research.</div></div>
-            <div className="actions"><button className="btn"><Radio size={14}/> Demo Feed</button><button className="btn primary" onClick={() => inputRef.current?.click()} disabled={busy}><UploadCloud size={14}/>{busy ? "Analyzing" : "Analyze Video"}</button></div>
+            <div className="actions"><button className="btn"><Radio size={14}/> {usingPersistedHistory ? "Live History" : "Demo Feed"}</button><button className="btn primary" onClick={() => inputRef.current?.click()} disabled={busy}><UploadCloud size={14}/>{busy ? "Analyzing" : "Analyze Video"}</button></div>
           </div>
 
           <div className="grid">
             <section className="panel index-panel">
-              <div className="panel-head"><div className="panel-title">VisionAlpha Economic Activity Index</div><div className="panel-meta">Composite · 30D</div></div>
-              <div className="index-body"><div className="big-index"><strong>82.41</strong><span className="delta">▲ 3.82%</span></div><div className="regime">● ECONOMIC EXPANSION</div><LinePlot/></div>
+              <div className="panel-head"><div className="panel-title">VisionAlpha Economic Activity Index</div><div className="panel-meta">Composite · {usingPersistedHistory ? `${historyData.length} observations` : "30D demo"}</div></div>
+              <div className="index-body"><div className="big-index"><strong>{latestIndex.toFixed(2)}</strong><span className={`delta ${changePct < 0 ? "negative" : ""}`}>{changePct >= 0 ? "▲" : "▼"} {Math.abs(changePct).toFixed(2)}%</span></div><div className="regime">● {regime}</div><LinePlot values={historyData}/></div>
             </section>
 
             <section className="panel signal-panel">
@@ -108,7 +147,7 @@ export default function Dashboard() {
 
             <section className="panel ingest-panel">
               <div className="panel-head"><div className="panel-title">Vision Ingestion</div><div className="panel-meta">VIDEO → FACTORS</div></div>
-              <div className="upload"><input ref={inputRef} hidden type="file" accept="video/*" onChange={e => analyze(e.target.files?.[0])}/><div className="drop" onClick={() => inputRef.current?.click()}><div><UploadCloud/><strong>{busy ? "Processing video..." : "Upload economic activity footage"}</strong><span>Roads, ports, stores, sites or industrial video</span></div></div>{analysis && <div className="result"><strong>Analysis complete</strong><br/>{analysis.frames_processed?.toLocaleString()} frames sampled · {analysis.unique_tracks} unique tracks · Activity index {analysis.activity_index?.toFixed(1)}</div>}{error && <div className="result"><strong>Backend unavailable</strong><br/>{error}. The research dashboard remains available in demo mode.</div>}</div>
+              <div className="upload"><input ref={inputRef} hidden type="file" accept="video/*" onChange={e => analyze(e.target.files?.[0])}/><div className="drop" onClick={() => inputRef.current?.click()}><div><UploadCloud/><strong>{busy ? "Processing video..." : "Upload economic activity footage"}</strong><span>Roads, ports, stores, sites or industrial video</span></div></div>{analysis && <div className="result"><strong>Analysis complete</strong><br/>{analysis.frames_processed?.toLocaleString()} frames sampled · {analysis.unique_tracks} unique tracks · Activity index {analysis.activity_index?.toFixed(1)}{analysis.persisted ? " · saved to history" : ""}</div>}{error && <div className="result"><strong>Backend unavailable</strong><br/>{error}. The research dashboard remains available in demo mode.</div>}</div>
             </section>
           </div>
         </main>
