@@ -23,7 +23,7 @@ from .database import (
 from .pipeline import analyze_video
 from .storage import create_signed_upload
 
-app = FastAPI(title="VisionAlpha API", version="0.3.0")
+app = FastAPI(title="VisionAlpha API", version="0.3.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -81,19 +81,35 @@ def _overview_from_history(rows: list[dict]) -> dict | None:
     }
 
 
-def _require_persistence() -> None:
+def _semantic_enabled() -> bool:
+    return os.getenv("ENABLE_SEMANTIC_UPLOADS", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _require_semantic() -> None:
+    if not _semantic_enabled():
+        raise HTTPException(
+            status_code=503,
+            detail="Full Engine uploads are disabled until the semantic worker is deployed",
+        )
     if not is_configured():
         raise HTTPException(status_code=503, detail="Supabase persistence is not configured")
 
 
 @app.get("/health")
 def health() -> dict:
+    if _semantic_enabled() and is_configured():
+        semantic_queue = "enabled"
+    elif _semantic_enabled():
+        semantic_queue = "unconfigured"
+    else:
+        semantic_queue = "disabled"
+
     return {
         "status": "ok",
         "service": "visionalpha-api",
         "mode": "serverless_motion_proxy",
         "persistence": "supabase" if is_configured() else "unconfigured",
-        "semantic_queue": "enabled" if is_configured() else "unconfigured",
+        "semantic_queue": semantic_queue,
     }
 
 
@@ -133,7 +149,7 @@ def overview() -> dict:
 
 @app.post("/api/v1/uploads/sign")
 def sign_semantic_upload(payload: UploadSignRequest) -> dict:
-    _require_persistence()
+    _require_semantic()
     suffix = Path(payload.filename).suffix.lower()
     if suffix not in SUPPORTED_VIDEO_SUFFIXES:
         raise HTTPException(status_code=415, detail="Unsupported video format")
@@ -167,7 +183,7 @@ def sign_semantic_upload(payload: UploadSignRequest) -> dict:
 
 @app.post("/api/v1/jobs")
 def submit_semantic_job(payload: JobRequest) -> dict:
-    _require_persistence()
+    _require_semantic()
     try:
         return queue_asset(payload.asset_id)
     except RuntimeError as exc:
@@ -176,7 +192,7 @@ def submit_semantic_job(payload: JobRequest) -> dict:
 
 @app.get("/api/v1/jobs/{job_id}")
 def semantic_job_status(job_id: str) -> dict:
-    _require_persistence()
+    _require_semantic()
     try:
         job = get_job(job_id)
     except RuntimeError as exc:
@@ -238,7 +254,7 @@ async def analyze(file: UploadFile = File(...)) -> dict:
                 if written > max_bytes:
                     raise HTTPException(
                         status_code=413,
-                        detail="Public demo accepts videos up to 4 MB. Use semantic upload for larger files.",
+                        detail="Public demo accepts videos up to 4 MB. Full Engine uploads are available when enabled.",
                     )
                 tmp.write(chunk)
         result = analyze_video(tmp_path, sample_every=4)
