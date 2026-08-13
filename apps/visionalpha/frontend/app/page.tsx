@@ -38,6 +38,10 @@ type SemanticJob = {
   analysis_run_id?: string | null;
 };
 
+type HealthPayload = {
+  semantic_queue?: "enabled" | "disabled" | "unconfigured";
+};
+
 function LinePlot({ values }: { values: number[] }) {
   const points = useMemo(() => {
     const safeValues = values.length ? values : [50];
@@ -74,6 +78,7 @@ export default function Dashboard() {
   const semanticInputRef = useRef<HTMLInputElement>(null);
   const [busy, setBusy] = useState(false);
   const [semanticBusy, setSemanticBusy] = useState(false);
+  const [semanticEnabled, setSemanticEnabled] = useState(false);
   const [semanticProgress, setSemanticProgress] = useState(0);
   const [semanticJob, setSemanticJob] = useState<SemanticJob | null>(null);
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
@@ -99,8 +104,19 @@ export default function Dashboard() {
     }
   }
 
+  async function loadCapabilities() {
+    try {
+      const response = await fetch(`${apiUrl}/health`, { cache: "no-store" });
+      if (!response.ok) return;
+      const payload = await response.json() as HealthPayload;
+      setSemanticEnabled(payload.semantic_queue === "enabled");
+    } catch {
+      setSemanticEnabled(false);
+    }
+  }
+
   useEffect(() => {
-    void loadHistory();
+    void Promise.all([loadHistory(), loadCapabilities()]);
   }, []);
 
   async function analyzeQuick(file?: File) {
@@ -169,7 +185,7 @@ export default function Dashboard() {
   }
 
   async function analyzeSemantic(file?: File) {
-    if (!file) return;
+    if (!file || !semanticEnabled) return;
     setSemanticBusy(true);
     setSemanticProgress(0);
     setSemanticJob(null);
@@ -242,7 +258,7 @@ export default function Dashboard() {
             <div className="actions">
               <button className="btn"><Radio size={14}/> {usingPersistedHistory ? "Live History" : "Demo Feed"}</button>
               <button className="btn" onClick={() => quickInputRef.current?.click()} disabled={busy || semanticBusy}><Video size={14}/>{busy ? "Analyzing" : "Quick Test"}</button>
-              <button className="btn primary" onClick={() => semanticInputRef.current?.click()} disabled={semanticBusy || busy}><UploadCloud size={14}/>{semanticBusy ? "Processing" : "Full Engine"}</button>
+              <button className="btn primary" onClick={() => semanticInputRef.current?.click()} disabled={!semanticEnabled || semanticBusy || busy}><UploadCloud size={14}/>{semanticEnabled ? (semanticBusy ? "Processing" : "Full Engine") : "Full Engine Soon"}</button>
             </div>
           </div>
 
@@ -267,8 +283,8 @@ export default function Dashboard() {
               <div className="panel-head"><div className="panel-title">Vision Ingestion</div><div className="panel-meta">VIDEO → STORAGE → GPU → FACTORS</div></div>
               <div className="upload">
                 <input ref={quickInputRef} hidden type="file" accept="video/*" onChange={e => analyzeQuick(e.target.files?.[0])}/>
-                <input ref={semanticInputRef} hidden type="file" accept="video/*" onChange={e => analyzeSemantic(e.target.files?.[0])}/>
-                <div className="drop" onClick={() => semanticInputRef.current?.click()}><div><UploadCloud/><strong>{semanticBusy ? `Full Engine ${semanticProgressLabel}` : "Upload for semantic analysis"}</strong><span>Resumable upload for roads, ports, stores, sites and industrial video</span></div></div>
+                <input ref={semanticInputRef} hidden type="file" accept="video/*" disabled={!semanticEnabled} onChange={e => analyzeSemantic(e.target.files?.[0])}/>
+                <div className="drop" onClick={() => semanticEnabled && semanticInputRef.current?.click()}><div><UploadCloud/><strong>{semanticEnabled ? (semanticBusy ? `Full Engine ${semanticProgressLabel}` : "Upload for semantic analysis") : "Full Engine worker deployment pending"}</strong><span>{semanticEnabled ? "Resumable upload for roads, ports, stores, sites and industrial video" : "Quick Test remains available while semantic compute is being provisioned"}</span></div></div>
                 {semanticJob && <div className="result"><strong>Full Engine job: {semanticJob.status}</strong><br/>Upload {semanticProgressLabel}{semanticJobProgress != null ? ` · Processing ${semanticJobProgress.toFixed(0)}%` : ""}{semanticJob.analysis_run_id ? " · saved to history" : ""}</div>}
                 {semanticError && <div className="result"><strong>Full Engine unavailable</strong><br/>{semanticError}</div>}
                 {analysis && <div className="result"><strong>Quick analysis complete</strong><br/>{analysis.frames_processed?.toLocaleString()} frames sampled · {analysis.unique_tracks} unique tracks · Activity index {analysis.activity_index?.toFixed(1)}{analysis.persisted ? " · saved to history" : ""}</div>}
