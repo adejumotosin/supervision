@@ -14,6 +14,7 @@ The public dashboard and coordination API remain on Vercel. Video bytes live in 
 - Tasks: 1
 - Parallelism: 1
 - Job timeout: 3600 seconds
+- Cloud Run task retries: 2
 - Worker mode: one queue item per execution
 
 ## 1. Select a Google Cloud project
@@ -89,12 +90,12 @@ gcloud run jobs deploy visionalpha-semantic-worker \
   --tasks 1 \
   --parallelism 1 \
   --task-timeout 3600s \
-  --max-retries 0 \
+  --max-retries 2 \
   --set-env-vars VISIONALPHA_ROLE=worker,WORKER_ONCE=1,SAMPLE_EVERY=3,VISION_CONFIDENCE=0.35,VISION_MODEL=yolo11n.pt,SUPABASE_URL=https://vqndwsvticfrsaecjlhl.supabase.co \
   --set-secrets SUPABASE_SECRET_KEY=visionalpha-supabase-secret:latest
 ```
 
-The application has its own queue retry policy. Cloud Run task retries are therefore disabled to avoid two independent retry systems retrying the same failed work.
+The database job allows up to three application attempts. In one-shot mode, a transient failure is requeued and the process exits nonzero, allowing Cloud Run's two task retries to restart the worker. Once the database attempt limit is reached, the job is marked failed and the worker exits normally.
 
 ## 7. Test the job manually
 
