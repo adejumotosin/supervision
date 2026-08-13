@@ -11,7 +11,17 @@ Public services:
 - Dashboard: `https://visionalpha.vercel.app`
 - Demo API: `https://visionalpha-api.vercel.app`
 - Health: `/health`
+- Historical activity series: `/api/v1/history`
 - Synthetic pipeline check: `/api/v1/selftest`
 - Video analysis: `POST /api/v1/analyze`
+
+## Supabase persistence
+
+When the following server-only environment variables are configured, completed analyses are persisted to Supabase and the overview/history endpoints use stored observations when available:
+
+- `SUPABASE_URL`
+- `SUPABASE_SECRET_KEY` or `SUPABASE_SERVICE_ROLE_KEY`
+
+Do not expose a Supabase secret or service-role key to the frontend.
 
 The public demo accepts video uploads up to 4 MB. For semantic vehicle, person, bus, truck and boat detection, deploy `apps/visionalpha/backend` to a container or GPU-capable platform.
