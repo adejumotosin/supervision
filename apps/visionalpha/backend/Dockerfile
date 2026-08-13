@@ -13,6 +13,7 @@ COPY apps/visionalpha/backend/requirements.txt /workspace/apps/visionalpha/backe
 RUN pip install --no-cache-dir -r /workspace/apps/visionalpha/backend/requirements.txt
 
 COPY apps/visionalpha/backend /workspace/apps/visionalpha/backend
-RUN touch /workspace/apps/__init__.py /workspace/apps/visionalpha/__init__.py
+RUN touch /workspace/apps/__init__.py /workspace/apps/visionalpha/__init__.py \
+    && chmod +x /workspace/apps/visionalpha/backend/entrypoint.sh
 
-CMD ["uvicorn", "apps.visionalpha.backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
+ENTRYPOINT ["/workspace/apps/visionalpha/backend/entrypoint.sh"]

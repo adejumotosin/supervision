@@ -2,17 +2,29 @@ from __future__ import annotations
 
 import os
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 import cv2
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
-from .database import get_history, is_configured, save_analysis
+from .database import (
+    create_asset,
+    get_history,
+    get_job,
+    is_configured,
+    queue_asset,
+    save_analysis,
+)
+from .gcp import is_configured as gcp_is_configured, trigger_worker_job
 from .pipeline import analyze_video
+from .storage import create_signed_upload
 
-app = FastAPI(title="VisionAlpha API", version="0.2.0")
+app = FastAPI(title="VisionAlpha API", version="0.3.2")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -24,6 +36,21 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+SUPPORTED_VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+UPLOAD_BUCKET = "visionalpha-video"
+TUS_CHUNK_BYTES = 6 * 1024 * 1024
+
+
+class UploadSignRequest(BaseModel):
+    filename: str = Field(min_length=1, max_length=255)
+    content_type: str | None = None
+    size_bytes: int = Field(ge=1)
+    location_id: str | None = None
+
+
+class JobRequest(BaseModel):
+    asset_id: str = Field(min_length=1)
 
 
 def _overview_from_history(rows: list[dict]) -> dict | None:
@@ -55,13 +82,42 @@ def _overview_from_history(rows: list[dict]) -> dict | None:
     }
 
 
+def _semantic_enabled() -> bool:
+    return os.getenv("ENABLE_SEMANTIC_UPLOADS", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _semantic_ready() -> bool:
+    return _semantic_enabled() and is_configured() and gcp_is_configured()
+
+
+def _require_semantic() -> None:
+    if not _semantic_enabled():
+        raise HTTPException(
+            status_code=503,
+            detail="Full Engine uploads are disabled until the semantic worker is deployed",
+        )
+    if not is_configured():
+        raise HTTPException(status_code=503, detail="Supabase persistence is not configured")
+    if not gcp_is_configured():
+        raise HTTPException(status_code=503, detail="Google Cloud semantic worker trigger is not configured")
+
+
 @app.get("/health")
 def health() -> dict:
+    if _semantic_ready():
+        semantic_queue = "enabled"
+    elif _semantic_enabled():
+        semantic_queue = "unconfigured"
+    else:
+        semantic_queue = "disabled"
+
     return {
         "status": "ok",
         "service": "visionalpha-api",
         "mode": "serverless_motion_proxy",
         "persistence": "supabase" if is_configured() else "unconfigured",
+        "semantic_queue": semantic_queue,
+        "worker_trigger": "gcp_cloud_run_job" if gcp_is_configured() else "unconfigured",
     }
 
 
@@ -97,6 +153,67 @@ def overview() -> dict:
         },
         "mode": "seeded_demo",
     }
+
+
+@app.post("/api/v1/uploads/sign")
+def sign_semantic_upload(payload: UploadSignRequest) -> dict:
+    _require_semantic()
+    suffix = Path(payload.filename).suffix.lower()
+    if suffix not in SUPPORTED_VIDEO_SUFFIXES:
+        raise HTTPException(status_code=415, detail="Unsupported video format")
+
+    max_bytes = int(os.getenv("MAX_SEMANTIC_UPLOAD_BYTES", str(1024 * 1024 * 1024)))
+    if payload.size_bytes > max_bytes:
+        raise HTTPException(status_code=413, detail="Video exceeds configured semantic upload limit")
+
+    now = datetime.now(timezone.utc)
+    object_path = f"uploads/{now:%Y/%m/%d}/{uuid4().hex}{suffix}"
+    try:
+        signed = create_signed_upload(UPLOAD_BUCKET, object_path)
+        asset = create_asset(
+            object_path=object_path,
+            bucket=UPLOAD_BUCKET,
+            original_filename=payload.filename,
+            content_type=payload.content_type,
+            size_bytes=payload.size_bytes,
+            location_id=payload.location_id,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return {
+        **signed,
+        "asset_id": asset["id"],
+        "chunk_size": TUS_CHUNK_BYTES,
+        "expires_in_seconds": 7200,
+    }
+
+
+@app.post("/api/v1/jobs")
+def submit_semantic_job(payload: JobRequest) -> dict:
+    _require_semantic()
+    try:
+        job = queue_asset(payload.asset_id)
+        execution = trigger_worker_job()
+        return {
+            **job,
+            "worker_triggered": True,
+            "cloud_run_operation": execution.get("name"),
+        }
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/jobs/{job_id}")
+def semantic_job_status(job_id: str) -> dict:
+    _require_semantic()
+    try:
+        job = get_job(job_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
 
 
 @app.get("/api/v1/selftest")
@@ -137,7 +254,7 @@ def selftest() -> dict:
 @app.post("/api/v1/analyze")
 async def analyze(file: UploadFile = File(...)) -> dict:
     suffix = Path(file.filename or "upload.mp4").suffix.lower() or ".mp4"
-    if suffix not in {".mp4", ".mov", ".avi", ".mkv", ".webm"}:
+    if suffix not in SUPPORTED_VIDEO_SUFFIXES:
         raise HTTPException(status_code=415, detail="Unsupported video format")
 
     max_bytes = 4 * 1024 * 1024
@@ -151,7 +268,7 @@ async def analyze(file: UploadFile = File(...)) -> dict:
                 if written > max_bytes:
                     raise HTTPException(
                         status_code=413,
-                        detail="Public demo accepts videos up to 4 MB",
+                        detail="Public demo accepts videos up to 4 MB. Full Engine uploads are available when enabled.",
                     )
                 tmp.write(chunk)
         result = analyze_video(tmp_path, sample_every=4)

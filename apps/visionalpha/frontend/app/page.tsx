@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Activity, BarChart3, Boxes, BrainCircuit, Database, Gauge, LineChart, Radio, Search, UploadCloud, Video } from "lucide-react";
+import * as tus from "tus-js-client";
 import { domains, factors, history } from "@/lib/data";
 
 const apiUrl = process.env.NEXT_PUBLIC_VISIONALPHA_API_URL || "http://localhost:8000";
@@ -18,6 +19,27 @@ type Analysis = {
 type HistoryItem = {
   created_at?: string;
   activity_index?: number | string | null;
+};
+
+type SemanticUploadTicket = {
+  token: string;
+  tus_endpoint: string;
+  bucket: string;
+  object_path: string;
+  asset_id: string;
+  chunk_size: number;
+};
+
+type SemanticJob = {
+  id: string;
+  status: "queued" | "running" | "succeeded" | "failed" | "canceled";
+  progress?: number | string;
+  error?: string | null;
+  analysis_run_id?: string | null;
+};
+
+type HealthPayload = {
+  semantic_queue?: "enabled" | "disabled" | "unconfigured";
 };
 
 function LinePlot({ values }: { values: number[] }) {
@@ -52,10 +74,16 @@ function DomainCard({ name, score, change, spark }: (typeof domains)[number]) {
 }
 
 export default function Dashboard() {
-  const inputRef = useRef<HTMLInputElement>(null);
+  const quickInputRef = useRef<HTMLInputElement>(null);
+  const semanticInputRef = useRef<HTMLInputElement>(null);
   const [busy, setBusy] = useState(false);
+  const [semanticBusy, setSemanticBusy] = useState(false);
+  const [semanticEnabled, setSemanticEnabled] = useState(false);
+  const [semanticProgress, setSemanticProgress] = useState(0);
+  const [semanticJob, setSemanticJob] = useState<SemanticJob | null>(null);
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [semanticError, setSemanticError] = useState<string | null>(null);
   const [historyData, setHistoryData] = useState<number[]>(history);
   const [usingPersistedHistory, setUsingPersistedHistory] = useState(false);
 
@@ -72,15 +100,26 @@ export default function Dashboard() {
         setUsingPersistedHistory(true);
       }
     } catch {
-      // The seeded research series remains visible when persistence is unavailable.
+      // Keep the seeded research series visible if persistence is unavailable.
+    }
+  }
+
+  async function loadCapabilities() {
+    try {
+      const response = await fetch(`${apiUrl}/health`, { cache: "no-store" });
+      if (!response.ok) return;
+      const payload = await response.json() as HealthPayload;
+      setSemanticEnabled(payload.semantic_queue === "enabled");
+    } catch {
+      setSemanticEnabled(false);
     }
   }
 
   useEffect(() => {
-    void loadHistory();
+    void Promise.all([loadHistory(), loadCapabilities()]);
   }, []);
 
-  async function analyze(file?: File) {
+  async function analyzeQuick(file?: File) {
     if (!file) return;
     setBusy(true); setError(null); setAnalysis(null);
     const body = new FormData(); body.append("file", file);
@@ -95,10 +134,101 @@ export default function Dashboard() {
     } finally { setBusy(false); }
   }
 
+  function uploadWithTus(file: File, ticket: SemanticUploadTicket) {
+    return new Promise<void>((resolve, reject) => {
+      const upload = new tus.Upload(file, {
+        endpoint: ticket.tus_endpoint,
+        retryDelays: [0, 3000, 5000, 10000, 20000],
+        headers: { "x-signature": ticket.token },
+        uploadDataDuringCreation: true,
+        removeFingerprintOnSuccess: true,
+        chunkSize: ticket.chunk_size,
+        metadata: {
+          bucketName: ticket.bucket,
+          objectName: ticket.object_path,
+          contentType: file.type || "video/mp4",
+          cacheControl: "3600",
+        },
+        onError: error => reject(error),
+        onProgress: (uploaded, total) => {
+          setSemanticProgress(total > 0 ? (uploaded / total) * 100 : 0);
+        },
+        onSuccess: () => resolve(),
+      });
+
+      upload.findPreviousUploads()
+        .then(previous => {
+          if (previous.length) upload.resumeFromPreviousUpload(previous[0]);
+          upload.start();
+        })
+        .catch(reject);
+    });
+  }
+
+  async function pollSemanticJob(jobId: string) {
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      const response = await fetch(`${apiUrl}/api/v1/jobs/${jobId}`, { cache: "no-store" });
+      if (!response.ok) throw new Error(`Job status returned ${response.status}`);
+      const job = await response.json() as SemanticJob;
+      setSemanticJob(job);
+
+      if (job.status === "succeeded") {
+        await loadHistory();
+        return;
+      }
+      if (job.status === "failed" || job.status === "canceled") {
+        throw new Error(job.error || `Semantic job ${job.status}`);
+      }
+      await new Promise(resolve => setTimeout(resolve, 3000));
+    }
+    throw new Error("Semantic processing is taking longer than expected. The job remains in the queue.");
+  }
+
+  async function analyzeSemantic(file?: File) {
+    if (!file || !semanticEnabled) return;
+    setSemanticBusy(true);
+    setSemanticProgress(0);
+    setSemanticJob(null);
+    setSemanticError(null);
+
+    try {
+      const signResponse = await fetch(`${apiUrl}/api/v1/uploads/sign`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          filename: file.name,
+          content_type: file.type || null,
+          size_bytes: file.size,
+        }),
+      });
+      if (!signResponse.ok) throw new Error(`Upload authorization returned ${signResponse.status}`);
+      const ticket = await signResponse.json() as SemanticUploadTicket;
+
+      await uploadWithTus(file, ticket);
+      setSemanticProgress(100);
+
+      const jobResponse = await fetch(`${apiUrl}/api/v1/jobs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ asset_id: ticket.asset_id }),
+      });
+      if (!jobResponse.ok) throw new Error(`Job submission returned ${jobResponse.status}`);
+      const job = await jobResponse.json() as SemanticJob;
+      setSemanticJob(job);
+      await pollSemanticJob(job.id);
+    } catch (e) {
+      setSemanticError(e instanceof Error ? e.message : "Semantic analysis failed");
+    } finally {
+      setSemanticBusy(false);
+    }
+  }
+
   const latestIndex = historyData.at(-1) ?? 82.41;
   const firstIndex = historyData[0] ?? latestIndex;
   const changePct = historyData.length > 1 ? ((latestIndex - firstIndex) / Math.max(Math.abs(firstIndex), 0.001)) * 100 : 0;
   const regime = latestIndex >= 55 ? "ECONOMIC EXPANSION" : latestIndex <= 45 ? "ECONOMIC CONTRACTION" : "NEUTRAL ACTIVITY";
+  const semanticProgressLabel = `${semanticProgress.toFixed(1)}%`;
+  const semanticJobProgress = semanticJob?.progress == null ? null : Number(semanticJob.progress);
 
   return (
     <div className="shell">
@@ -119,13 +249,17 @@ export default function Dashboard() {
           <div className="nav-label" style={{marginTop: 24}}>DATA</div>
           <button className="nav-item"><Database/> Sources</button>
           <button className="nav-item"><Activity/> Backtests</button>
-          <div className="sidebar-foot"><strong>Research build 0.2</strong><span>Raw CV observations are normalized against location-specific baselines before becoming investment factors.</span></div>
+          <div className="sidebar-foot"><strong>Research build 0.3</strong><span>Full Engine observations are normalized to per-minute rates before location-specific baseline calibration.</span></div>
         </aside>
 
         <main className="main">
           <div className="hero-row">
             <div><div className="eyebrow">Alternative Data Intelligence</div><h1>Economic Activity Monitor</h1><div className="subtitle">Computer vision derived activity proxies, standardized for investment research.</div></div>
-            <div className="actions"><button className="btn"><Radio size={14}/> {usingPersistedHistory ? "Live History" : "Demo Feed"}</button><button className="btn primary" onClick={() => inputRef.current?.click()} disabled={busy}><UploadCloud size={14}/>{busy ? "Analyzing" : "Analyze Video"}</button></div>
+            <div className="actions">
+              <button className="btn"><Radio size={14}/> {usingPersistedHistory ? "Live History" : "Demo Feed"}</button>
+              <button className="btn" onClick={() => quickInputRef.current?.click()} disabled={busy || semanticBusy}><Video size={14}/>{busy ? "Analyzing" : "Quick Test"}</button>
+              <button className="btn primary" onClick={() => semanticInputRef.current?.click()} disabled={!semanticEnabled || semanticBusy || busy}><UploadCloud size={14}/>{semanticEnabled ? (semanticBusy ? "Processing" : "Full Engine") : "Full Engine Soon"}</button>
+            </div>
           </div>
 
           <div className="grid">
@@ -135,8 +269,8 @@ export default function Dashboard() {
             </section>
 
             <section className="panel signal-panel">
-              <div className="panel-head"><div className="panel-title">Model Signal</div><div className="panel-meta">NGA · INDUSTRIAL</div></div>
-              <div className="signal-body"><div className="signal-hero"><div className="signal-top"><span className="signal-name">Nigeria Industrial Activity</span><span className="badge">BULLISH</span></div><div className="confidence"><span>Signal confidence</span><strong>87%</strong></div><div className="bar"><span style={{width:"87%"}}/></div></div><p className="thesis">Transport, port and heavy-equipment activity are above baseline while retail footfall remains soft. The composite currently indicates broad physical-economy expansion.</p></div>
+              <div className="panel-head"><div className="panel-title">Model Signal</div><div className="panel-meta">NGA · PORT & LOGISTICS</div></div>
+              <div className="signal-body"><div className="signal-hero"><div className="signal-top"><span className="signal-name">Port & Logistics Activity</span><span className="badge">RESEARCH</span></div><div className="confidence"><span>Baseline status</span><strong>PROVISIONAL</strong></div><div className="bar"><span style={{width:"50%"}}/></div></div><p className="thesis">Phase 3 separates truck, boat, bus and car flow into a dedicated logistics index. Production signals require location, camera, hour, weekday and seasonal calibration before investment use.</p></div>
             </section>
 
             <section className="panel domain-panel">
@@ -146,8 +280,16 @@ export default function Dashboard() {
             </section>
 
             <section className="panel ingest-panel">
-              <div className="panel-head"><div className="panel-title">Vision Ingestion</div><div className="panel-meta">VIDEO → FACTORS</div></div>
-              <div className="upload"><input ref={inputRef} hidden type="file" accept="video/*" onChange={e => analyze(e.target.files?.[0])}/><div className="drop" onClick={() => inputRef.current?.click()}><div><UploadCloud/><strong>{busy ? "Processing video..." : "Upload economic activity footage"}</strong><span>Roads, ports, stores, sites or industrial video</span></div></div>{analysis && <div className="result"><strong>Analysis complete</strong><br/>{analysis.frames_processed?.toLocaleString()} frames sampled · {analysis.unique_tracks} unique tracks · Activity index {analysis.activity_index?.toFixed(1)}{analysis.persisted ? " · saved to history" : ""}</div>}{error && <div className="result"><strong>Backend unavailable</strong><br/>{error}. The research dashboard remains available in demo mode.</div>}</div>
+              <div className="panel-head"><div className="panel-title">Vision Ingestion</div><div className="panel-meta">VIDEO → STORAGE → GPU → FACTORS</div></div>
+              <div className="upload">
+                <input ref={quickInputRef} hidden type="file" accept="video/*" onChange={e => analyzeQuick(e.target.files?.[0])}/>
+                <input ref={semanticInputRef} hidden type="file" accept="video/*" disabled={!semanticEnabled} onChange={e => analyzeSemantic(e.target.files?.[0])}/>
+                <div className="drop" onClick={() => semanticEnabled && semanticInputRef.current?.click()}><div><UploadCloud/><strong>{semanticEnabled ? (semanticBusy ? `Full Engine ${semanticProgressLabel}` : "Upload for semantic analysis") : "Full Engine worker deployment pending"}</strong><span>{semanticEnabled ? "Resumable upload for roads, ports, stores, sites and industrial video" : "Quick Test remains available while semantic compute is being provisioned"}</span></div></div>
+                {semanticJob && <div className="result"><strong>Full Engine job: {semanticJob.status}</strong><br/>Upload {semanticProgressLabel}{semanticJobProgress != null ? ` · Processing ${semanticJobProgress.toFixed(0)}%` : ""}{semanticJob.analysis_run_id ? " · saved to history" : ""}</div>}
+                {semanticError && <div className="result"><strong>Full Engine unavailable</strong><br/>{semanticError}</div>}
+                {analysis && <div className="result"><strong>Quick analysis complete</strong><br/>{analysis.frames_processed?.toLocaleString()} frames sampled · {analysis.unique_tracks} unique tracks · Activity index {analysis.activity_index?.toFixed(1)}{analysis.persisted ? " · saved to history" : ""}</div>}
+                {error && <div className="result"><strong>Quick analysis unavailable</strong><br/>{error}. The research dashboard remains available in demo mode.</div>}
+              </div>
             </section>
           </div>
         </main>

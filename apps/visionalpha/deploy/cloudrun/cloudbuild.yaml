@@ -1,0 +1,15 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - apps/visionalpha/backend/Dockerfile.gpu
+      - -t
+      - ${_IMAGE_URI}
+      - .
+images:
+  - ${_IMAGE_URI}
+substitutions:
+  _IMAGE_URI: europe-west1-docker.pkg.dev/${PROJECT_ID}/visionalpha/visionalpha-worker:latest
+options:
+  dynamicSubstitutions: true
