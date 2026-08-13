@@ -1,0 +1,31 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /workspace
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Cloud Run L4 currently exposes a CUDA 12.2-capable driver. Use a CUDA 12.1
+# PyTorch wheel so GPU inference works without forward-compatibility packages.
+RUN pip install --no-cache-dir \
+    torch==2.5.1 torchvision==0.20.1 \
+    --index-url https://download.pytorch.org/whl/cu121
+
+COPY pyproject.toml README.md LICENSE.md /workspace/
+COPY src /workspace/src
+RUN pip install --no-cache-dir -e .
+
+COPY apps/visionalpha/backend/requirements.txt /workspace/apps/visionalpha/backend/requirements.txt
+RUN pip install --no-cache-dir -r /workspace/apps/visionalpha/backend/requirements.txt
+
+COPY apps/visionalpha/backend /workspace/apps/visionalpha/backend
+RUN touch /workspace/apps/__init__.py /workspace/apps/visionalpha/__init__.py \
+    && chmod +x /workspace/apps/visionalpha/backend/entrypoint.sh \
+    && python -c "from ultralytics import YOLO; YOLO('yolo11n.pt')"
+
+ENTRYPOINT ["/workspace/apps/visionalpha/backend/entrypoint.sh"]
