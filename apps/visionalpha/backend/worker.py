@@ -4,6 +4,7 @@ import os
 import socket
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .database import (
@@ -21,6 +22,10 @@ def _worker_id() -> str:
     return os.getenv("WORKER_ID", "").strip() or socket.gethostname()
 
 
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 def process_one_job() -> bool:
     worker_id = _worker_id()
     job = claim_next_job(worker_id)
@@ -31,7 +36,7 @@ def process_one_job() -> bool:
     asset_id = str(job["asset_id"])
     asset = get_asset(asset_id)
     if asset is None:
-        update_job(job_id, status="failed", error="Video asset not found", progress=100)
+        update_job(job_id, status="failed", error="Video asset not found", progress=100, completed_at=_now())
         return True
 
     suffix = Path(asset.get("original_filename") or asset.get("object_path") or "video.mp4").suffix or ".mp4"
@@ -64,7 +69,7 @@ def process_one_job() -> bool:
             status="succeeded",
             progress=100,
             analysis_run_id=analysis.get("id"),
-            completed_at="now()",
+            completed_at=_now(),
             error=None,
         )
         update_asset(
@@ -79,7 +84,7 @@ def process_one_job() -> bool:
             status="failed",
             progress=100,
             error=str(exc)[:4000],
-            completed_at="now()",
+            completed_at=_now(),
         )
         update_asset(asset_id, status="failed")
         return True
