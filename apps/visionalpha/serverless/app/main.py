@@ -20,10 +20,11 @@ from .database import (
     queue_asset,
     save_analysis,
 )
+from .gcp import is_configured as gcp_is_configured, trigger_worker_job
 from .pipeline import analyze_video
 from .storage import create_signed_upload
 
-app = FastAPI(title="VisionAlpha API", version="0.3.1")
+app = FastAPI(title="VisionAlpha API", version="0.3.2")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -85,6 +86,10 @@ def _semantic_enabled() -> bool:
     return os.getenv("ENABLE_SEMANTIC_UPLOADS", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _semantic_ready() -> bool:
+    return _semantic_enabled() and is_configured() and gcp_is_configured()
+
+
 def _require_semantic() -> None:
     if not _semantic_enabled():
         raise HTTPException(
@@ -93,11 +98,13 @@ def _require_semantic() -> None:
         )
     if not is_configured():
         raise HTTPException(status_code=503, detail="Supabase persistence is not configured")
+    if not gcp_is_configured():
+        raise HTTPException(status_code=503, detail="Google Cloud semantic worker trigger is not configured")
 
 
 @app.get("/health")
 def health() -> dict:
-    if _semantic_enabled() and is_configured():
+    if _semantic_ready():
         semantic_queue = "enabled"
     elif _semantic_enabled():
         semantic_queue = "unconfigured"
@@ -110,6 +117,7 @@ def health() -> dict:
         "mode": "serverless_motion_proxy",
         "persistence": "supabase" if is_configured() else "unconfigured",
         "semantic_queue": semantic_queue,
+        "worker_trigger": "gcp_cloud_run_job" if gcp_is_configured() else "unconfigured",
     }
 
 
@@ -185,7 +193,13 @@ def sign_semantic_upload(payload: UploadSignRequest) -> dict:
 def submit_semantic_job(payload: JobRequest) -> dict:
     _require_semantic()
     try:
-        return queue_asset(payload.asset_id)
+        job = queue_asset(payload.asset_id)
+        execution = trigger_worker_job()
+        return {
+            **job,
+            "worker_triggered": True,
+            "cloud_run_operation": execution.get("name"),
+        }
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
