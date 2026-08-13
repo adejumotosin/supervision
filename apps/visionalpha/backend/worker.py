@@ -79,14 +79,29 @@ def process_one_job() -> bool:
         )
         return True
     except Exception as exc:
-        update_job(
-            job_id,
-            status="failed",
-            progress=100,
-            error=str(exc)[:4000],
-            completed_at=_now(),
-        )
-        update_asset(asset_id, status="failed")
+        attempts = int(job.get("attempts") or 1)
+        max_attempts = int(job.get("max_attempts") or 3)
+        message = str(exc)[:4000]
+
+        if attempts < max_attempts:
+            update_job(
+                job_id,
+                status="queued",
+                progress=0,
+                worker_id=None,
+                started_at=None,
+                error=message,
+            )
+            update_asset(asset_id, status="queued")
+        else:
+            update_job(
+                job_id,
+                status="failed",
+                progress=100,
+                error=message,
+                completed_at=_now(),
+            )
+            update_asset(asset_id, status="failed")
         return True
     finally:
         if tmp_path and os.path.exists(tmp_path):
