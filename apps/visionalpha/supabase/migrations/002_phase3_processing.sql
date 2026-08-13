@@ -1,3 +1,18 @@
+insert into storage.buckets (id, name, public, allowed_mime_types)
+values (
+  'visionalpha-video',
+  'visionalpha-video',
+  false,
+  array[
+    'video/mp4',
+    'video/quicktime',
+    'video/x-msvideo',
+    'video/x-matroska',
+    'video/webm'
+  ]
+)
+on conflict (id) do nothing;
+
 create table if not exists public.video_assets (
   id uuid primary key default gen_random_uuid(),
   location_id uuid references public.locations(id) on delete set null,
@@ -8,8 +23,8 @@ create table if not exists public.video_assets (
   content_type text,
   size_bytes bigint check (size_bytes is null or size_bytes >= 0),
   duration_seconds numeric(12,3),
-  status text not null default 'uploaded'
-    check (status in ('uploaded', 'queued', 'processing', 'processed', 'failed')),
+  status text not null default 'pending_upload'
+    check (status in ('pending_upload', 'uploaded', 'queued', 'processing', 'processed', 'failed')),
   metadata jsonb not null default '{}'::jsonb,
   created_at timestamptz not null default now(),
   unique (bucket, object_path)
