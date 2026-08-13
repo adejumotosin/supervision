@@ -26,6 +26,10 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _one_shot() -> bool:
+    return os.getenv("WORKER_ONCE", "0").strip() == "1"
+
+
 def process_one_job() -> bool:
     worker_id = _worker_id()
     job = claim_next_job(worker_id)
@@ -93,6 +97,8 @@ def process_one_job() -> bool:
                 error=message,
             )
             update_asset(asset_id, status="queued")
+            if _one_shot():
+                raise RuntimeError(message) from exc
         else:
             update_job(
                 job_id,
@@ -110,7 +116,7 @@ def process_one_job() -> bool:
 
 def run_worker() -> None:
     poll_seconds = max(1.0, float(os.getenv("WORKER_POLL_SECONDS", "5")))
-    once = os.getenv("WORKER_ONCE", "0").strip() == "1"
+    once = _one_shot()
 
     while True:
         processed = process_one_job()
