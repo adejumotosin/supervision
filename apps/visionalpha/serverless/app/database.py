@@ -4,10 +4,11 @@ import json
 import os
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 
-def _credentials() -> tuple[str, str] | None:
+def credentials() -> tuple[str, str] | None:
     url = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
     key = (
         os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
@@ -19,15 +20,15 @@ def _credentials() -> tuple[str, str] | None:
 
 
 def is_configured() -> bool:
-    return _credentials() is not None
+    return credentials() is not None
 
 
 def _request(method: str, resource: str, payload: dict[str, Any] | None = None) -> Any:
-    credentials = _credentials()
-    if credentials is None:
+    configured = credentials()
+    if configured is None:
         raise RuntimeError("Supabase persistence is not configured")
 
-    base_url, key = credentials
+    base_url, key = configured
     body = json.dumps(payload).encode("utf-8") if payload is not None else None
     request = Request(
         f"{base_url}/rest/v1/{resource}",
@@ -42,10 +43,13 @@ def _request(method: str, resource: str, payload: dict[str, Any] | None = None) 
         },
     )
     try:
-        with urlopen(request, timeout=8) as response:
+        with urlopen(request, timeout=12) as response:
             raw = response.read().decode("utf-8")
             return json.loads(raw) if raw else None
-    except (HTTPError, URLError) as exc:
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Supabase request failed ({exc.code}): {detail}") from exc
+    except URLError as exc:
         raise RuntimeError(f"Supabase request failed: {exc}") from exc
 
 
@@ -76,7 +80,8 @@ def get_history(limit: int = 30) -> list[dict[str, Any]]:
     limit = max(1, min(int(limit), 100))
     columns = (
         "id,created_at,filename,source_mode,frames_processed,unique_tracks,"
-        "activity_index,counts,feature_scores,avg_motion_ratio"
+        "activity_index,counts,feature_scores,avg_motion_ratio,duration_seconds,"
+        "rates_per_minute,domain_indices,engine_version"
     )
     rows = _request(
         "GET",
@@ -86,3 +91,47 @@ def get_history(limit: int = 30) -> list[dict[str, Any]]:
         return []
     rows.reverse()
     return rows
+
+
+def create_asset(
+    *,
+    object_path: str,
+    bucket: str,
+    original_filename: str | None,
+    content_type: str | None,
+    size_bytes: int | None,
+    location_id: str | None = None,
+) -> dict[str, Any]:
+    payload = {
+        "object_path": object_path,
+        "bucket": bucket,
+        "original_filename": original_filename,
+        "content_type": content_type,
+        "size_bytes": size_bytes,
+        "location_id": location_id,
+        "status": "pending_upload",
+    }
+    rows = _request("POST", "video_assets", payload)
+    if not isinstance(rows, list) or not rows:
+        raise RuntimeError("Supabase did not return the created asset")
+    return rows[0]
+
+
+def queue_asset(asset_id: str) -> dict[str, Any]:
+    rows = _request(
+        "POST",
+        "processing_jobs",
+        {"asset_id": asset_id, "engine": "yolo_supervision", "status": "queued"},
+    )
+    if not isinstance(rows, list) or not rows:
+        raise RuntimeError("Supabase did not return the created job")
+    _request("PATCH", f"video_assets?id=eq.{quote(asset_id)}", {"status": "queued"})
+    return rows[0]
+
+
+def get_job(job_id: str) -> dict[str, Any] | None:
+    rows = _request(
+        "GET",
+        f"processing_jobs?id=eq.{quote(job_id)}&select=*&limit=1",
+    )
+    return rows[0] if isinstance(rows, list) and rows else None
